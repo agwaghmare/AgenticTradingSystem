@@ -17,7 +17,7 @@ from app.services import data_pipeline, earnings, equity_tracker, risk_logger, n
 
 logger = logging.getLogger("agent")
 
-MODEL_VERSION = "agentic-trading-v0.1"
+MODEL_VERSION = "agentic-trading-v0.2"
 
 
 class TradingAgent:
@@ -25,6 +25,8 @@ class TradingAgent:
         self.broker = broker
         self.regime_detector = regime_detector
         self._prev_hedge_ratios: dict[tuple[str, str], float] = {}
+        self._consecutive_breaks: dict[tuple[str, str], int] = {}
+        self._open_positions: dict[tuple[str, str], dict] = {}
 
     async def run_cycle(
         self,
@@ -41,14 +43,27 @@ class TradingAgent:
         drawdown_mtd = await equity_tracker.calc_drawdown_mtd(db, nav)
         halt_status = risk_engine.get_drawdown_status(drawdown_mtd)
 
+        portfolio_var = self._calc_portfolio_var(nav, open_positions, price_data)
+        var_breached = nav > 0 and portfolio_var / nav > settings.daily_var_95_max_pct
+
         gross_exposure = sum(abs(p["market_value"]) for p in open_positions) / nav if nav else 0.0
         net_exposure = sum(p["market_value"] for p in open_positions) / nav if nav else 0.0
-        portfolio_var = self._calc_portfolio_var(nav, open_positions, price_data)
+
+        all_tickers = sorted({t for pair in candidate_pairs for t in pair})
+        for pos in open_positions:
+            all_tickers.append(pos["ticker"])
+        sector_map = await data_pipeline.get_sector_map(db, sorted(set(all_tickers)))
+
+        self._reconcile_open_positions(open_positions, candidate_pairs, price_data)
 
         if halt_status == "HALTED":
             self.broker.flatten_all_positions()
-            halt_reason = "Drawdown breached flatten threshold, agent halted"
-            notifier.notify_halt(halt_reason)
+            self._open_positions.clear()
+            self._consecutive_breaks.clear()
+            notifier.notify_halt(
+                f"Drawdown breached flatten threshold (MTD: {drawdown_mtd:.1%}). "
+                f"All positions flattened. Agent halted."
+            )
             await decision_logger.log_decision(
                 db,
                 DecisionLogSchema(
@@ -57,7 +72,7 @@ class TradingAgent:
                     pair_b="ALL",
                     action="EXIT",
                     regime=regime,
-                    reasoning=halt_reason,
+                    reasoning=f"Drawdown breached flatten threshold (MTD: {drawdown_mtd:.1%})",
                     model_version=MODEL_VERSION,
                     nav_at_decision=nav,
                 ),
@@ -76,15 +91,9 @@ class TradingAgent:
             )
             return
 
-        allow_new_entries = halt_status == "NORMAL" and regime == "range_bound"
-        if allow_new_entries and nav > 0 and portfolio_var / nav > settings.daily_var_95_max_pct:
-            allow_new_entries = False
-            logger.info("New entries blocked: portfolio VaR %.2f exceeds cap", portfolio_var)
-
-        all_tickers = sorted({t for pair in candidate_pairs for t in pair})
-        for pos in open_positions:
-            all_tickers.append(pos["ticker"])
-        sector_map = await data_pipeline.get_sector_map(db, sorted(set(all_tickers)))
+        allow_new_entries = halt_status == "NORMAL" and regime == "range_bound" and not var_breached
+        if var_breached:
+            logger.warning("Portfolio VaR %.2f exceeds cap — new entries disallowed", portfolio_var)
 
         for pair_a, pair_b in candidate_pairs:
             await self._evaluate_pair(
@@ -126,6 +135,7 @@ class TradingAgent:
         allow_new_entries,
         sector_map,
     ):
+        pair_key = (pair_a, pair_b)
         series_a = price_data.get(pair_a, {}).get("close")
         series_b = price_data.get(pair_b, {}).get("close")
 
@@ -133,7 +143,19 @@ class TradingAgent:
             await self._reject(db, cycle_id, pair_a, pair_b, regime, "Stale or missing price data")
             return
 
-        coint_result = stats_engine.check_cointegration(series_a, series_b, pair_a, pair_b)
+        try:
+            coint_result = stats_engine.check_cointegration(series_a, series_b, pair_a, pair_b)
+        except Exception:
+            logger.exception("Cointegration failed for %s/%s", pair_a, pair_b)
+            return
+
+        # Held position: check exits FIRST — dollar stop and z-score stop before coint break.
+        if pair_key in self._open_positions:
+            await self._evaluate_exit(
+                db, cycle_id, pair_a, pair_b, series_a, series_b, coint_result, regime
+            )
+            return
+
         if not coint_result.is_cointegrated:
             await self._reject(
                 db,
@@ -147,9 +169,9 @@ class TradingAgent:
             )
             return
 
-        prev_ratio = self._prev_hedge_ratios.get((pair_a, pair_b))
+        prev_ratio = self._prev_hedge_ratios.get(pair_key)
         hedge_result = stats_engine.compute_hedge_ratio_kalman(series_a, series_b, pair_a, pair_b, prev_ratio)
-        self._prev_hedge_ratios[(pair_a, pair_b)] = hedge_result.hedge_ratio
+        self._prev_hedge_ratios[pair_key] = hedge_result.hedge_ratio
 
         if hedge_result.drift_pct > settings.hedge_drift_max_pct:
             await self._reject(
@@ -164,14 +186,17 @@ class TradingAgent:
             )
             return
 
-        if await earnings.check_earnings_blackout(pair_a) or await earnings.check_earnings_blackout(pair_b):
+        blackout_a = await earnings.check_earnings_blackout(pair_a)
+        blackout_b = await earnings.check_earnings_blackout(pair_b)
+        if blackout_a or blackout_b:
+            blocked = pair_a if blackout_a else pair_b
             await self._reject(
                 db,
                 cycle_id,
                 pair_a,
                 pair_b,
                 regime,
-                "Earnings blackout window active",
+                f"Earnings blackout active for {blocked}",
                 hedge_ratio=hedge_result.hedge_ratio,
                 p_value=coint_result.p_value,
                 half_life_days=coint_result.half_life_days,
@@ -246,6 +271,7 @@ class TradingAgent:
         gross_exposure = (sum(abs(p["market_value"]) for p in open_positions) + notional_a + notional_b) / nav
         net_delta = (notional_a - notional_b) if action == "ENTER_LONG" else (-notional_a + notional_b)
         net_exposure = (sum(p["market_value"] for p in open_positions) + net_delta) / nav
+        open_pair_count = self._count_open_pairs()
 
         risk_check = risk_engine.check_risk_limits(
             notional_a,
@@ -253,7 +279,7 @@ class TradingAgent:
             max_sector_notional,
             gross_exposure,
             net_exposure,
-            len(open_positions),
+            open_pair_count,
         )
 
         if not risk_check.passed:
@@ -285,10 +311,24 @@ class TradingAgent:
 
         side_a = "BUY" if action == "ENTER_LONG" else "SELL"
         side_b = "SELL" if action == "ENTER_LONG" else "BUY"
-
         qty_b = size * hedge_result.hedge_ratio
+
         order_a = self.broker.place_market_order(pair_a, size, side_a)
         order_b = self.broker.place_market_order(pair_b, qty_b, side_b)
+
+        dollar_stop_price_a = price_a - stop_distance if action == "ENTER_LONG" else price_a + stop_distance
+        self._open_positions[pair_key] = {
+            "direction": "LONG_SPREAD" if action == "ENTER_LONG" else "SHORT_SPREAD",
+            "entry_price_a": price_a,
+            "entry_price_b": price_b,
+            "hedge_ratio": hedge_result.hedge_ratio,
+            "dollar_stop_price_a": dollar_stop_price_a,
+            "shares_a": size,
+            "shares_b": qty_b,
+        }
+        self._consecutive_breaks[pair_key] = 0
+
+        notifier.notify_trade_signal(pair_a, pair_b, action, side_a, side_b, size, qty_b, z, hedge_result.hedge_ratio)
 
         await decision_logger.log_decision(
             db,
@@ -303,24 +343,151 @@ class TradingAgent:
                 p_value=coint_result.p_value,
                 half_life_days=coint_result.half_life_days,
                 regime=regime,
-                reasoning=f"Z-score {z:.2f} triggered entry, cointegrated p={coint_result.p_value:.4f}",
+                reasoning=(
+                    f"Z-score {z:.2f} triggered entry, p={coint_result.p_value:.4f}, "
+                    f"ATR stop={stop_distance:.2f}"
+                ),
                 model_version=MODEL_VERSION,
                 nav_at_decision=nav,
                 position_size=notional_a,
             ),
         )
         logger.info("Executed %s on %s/%s: %s, %s", action, pair_a, pair_b, order_a, order_b)
-        notifier.notify_trade_signal(
-            pair_a,
-            pair_b,
-            action,
-            side_a,
-            side_b,
-            size,
-            qty_b,
-            z,
-            hedge_result.hedge_ratio,
+
+    async def _evaluate_exit(
+        self, db, cycle_id, pair_a, pair_b, series_a, series_b, coint_result, regime
+    ):
+        pair_key = (pair_a, pair_b)
+        pos = self._open_positions[pair_key]
+        price_a_today = float(series_a.iloc[-1])
+
+        hit_dollar_stop = (
+            price_a_today <= pos["dollar_stop_price_a"]
+            if pos["direction"] == "LONG_SPREAD"
+            else price_a_today >= pos["dollar_stop_price_a"]
         )
+
+        z = None
+        if coint_result.is_cointegrated:
+            try:
+                hedge_result = stats_engine.compute_hedge_ratio_kalman(
+                    series_a, series_b, pair_a, pair_b, self._prev_hedge_ratios.get(pair_key)
+                )
+                self._prev_hedge_ratios[pair_key] = hedge_result.hedge_ratio
+                spread = series_a - hedge_result.hedge_ratio * series_b
+                z = stats_engine.calc_zscore(spread)
+            except Exception:
+                z = None
+
+        hit_zscore_stop = z is not None and abs(z) >= settings.zscore_stop
+        hit_target = z is not None and abs(z) <= settings.zscore_exit
+
+        if coint_result.is_cointegrated:
+            self._consecutive_breaks[pair_key] = 0
+        else:
+            self._consecutive_breaks[pair_key] = self._consecutive_breaks.get(pair_key, 0) + 1
+
+        hit_coint_break = self._consecutive_breaks.get(pair_key, 0) >= settings.consecutive_breaks_to_exit
+
+        exit_reason = None
+        if hit_dollar_stop:
+            exit_reason = "dollar_stop"
+        elif hit_zscore_stop:
+            exit_reason = "zscore_stop"
+        elif hit_target:
+            exit_reason = "target"
+        elif hit_coint_break:
+            exit_reason = "cointegration_broke"
+
+        if exit_reason is None:
+            return
+
+        side_a = "SELL" if pos["direction"] == "LONG_SPREAD" else "BUY"
+        side_b = "BUY" if pos["direction"] == "LONG_SPREAD" else "SELL"
+
+        order_a = self.broker.place_market_order(pair_a, pos["shares_a"], side_a)
+        order_b = self.broker.place_market_order(pair_b, pos["shares_b"], side_b)
+
+        notifier.notify_exit(pair_a, pair_b, exit_reason, z_score=z)
+
+        await decision_logger.log_decision(
+            db,
+            DecisionLogSchema(
+                cycle_id=cycle_id,
+                pair_a=pair_a,
+                pair_b=pair_b,
+                action="EXIT",
+                z_score=z,
+                hedge_ratio=pos["hedge_ratio"],
+                p_value=coint_result.p_value,
+                half_life_days=coint_result.half_life_days,
+                regime=regime,
+                reasoning=f"Exit on {exit_reason}",
+                model_version=MODEL_VERSION,
+                nav_at_decision=self.broker.get_account_nav(),
+            ),
+        )
+        logger.info("Exited %s/%s on %s: %s, %s", pair_a, pair_b, exit_reason, order_a, order_b)
+
+        del self._open_positions[pair_key]
+        self._consecutive_breaks.pop(pair_key, None)
+
+    def _reconcile_open_positions(
+        self,
+        open_positions: list[dict],
+        candidate_pairs: list[tuple[str, str]],
+        price_data: dict,
+    ):
+        """Drop stale in-memory entries; rebuild from broker if both legs exist."""
+        broker_tickers = {p["ticker"] for p in open_positions}
+        pos_by_ticker = {p["ticker"]: p for p in open_positions}
+
+        for pair_key in list(self._open_positions.keys()):
+            pair_a, pair_b = pair_key
+            if pair_a not in broker_tickers or pair_b not in broker_tickers:
+                logger.warning("Dropping stale in-memory position for %s/%s", pair_a, pair_b)
+                self._open_positions.pop(pair_key, None)
+                self._consecutive_breaks.pop(pair_key, None)
+
+        for pair_a, pair_b in candidate_pairs:
+            pair_key = (pair_a, pair_b)
+            if pair_key in self._open_positions:
+                continue
+            if pair_a not in broker_tickers or pair_b not in broker_tickers:
+                continue
+
+            series_a = price_data.get(pair_a, {}).get("close")
+            series_b = price_data.get(pair_b, {}).get("close")
+            if series_a is None or series_b is None:
+                continue
+
+            leg_a = pos_by_ticker[pair_a]
+            leg_b = pos_by_ticker[pair_b]
+            long_a = leg_a["qty"] > 0
+            direction = "LONG_SPREAD" if long_a else "SHORT_SPREAD"
+
+            high_a = price_data.get(pair_a, {}).get("high", series_a)
+            low_a = price_data.get(pair_a, {}).get("low", series_a)
+            atr = stats_engine.calc_atr(high_a, low_a, series_a, settings.atr_period)
+            stop_distance = atr * settings.atr_stop_multiplier
+            entry_a = float(leg_a["avg_entry_price"])
+            entry_b = float(leg_b["avg_entry_price"])
+            dollar_stop = entry_a - stop_distance if direction == "LONG_SPREAD" else entry_a + stop_distance
+
+            self._open_positions[pair_key] = {
+                "direction": direction,
+                "entry_price_a": entry_a,
+                "entry_price_b": entry_b,
+                "hedge_ratio": abs(float(leg_b["qty"])) / abs(float(leg_a["qty"])) if leg_a["qty"] else 1.0,
+                "dollar_stop_price_a": dollar_stop,
+                "shares_a": abs(float(leg_a["qty"])),
+                "shares_b": abs(float(leg_b["qty"])),
+            }
+            self._consecutive_breaks.setdefault(pair_key, 0)
+            logger.info("Reconciled open position from broker for %s/%s", pair_a, pair_b)
+
+    def _count_open_pairs(self) -> int:
+        return len(self._open_positions)
 
     def _check_pair_correlation(self, pair_a, pair_b, price_data, open_positions):
         series_a = price_data.get(pair_a, {}).get("close")
@@ -338,9 +505,7 @@ class TradingAgent:
                 existing_returns[ticker] = close.pct_change().dropna().values[-60:]
 
         return risk_engine.check_correlation_exposure(
-            new_returns,
-            existing_returns,
-            settings.correlation_threshold,
+            new_returns, existing_returns, settings.correlation_threshold
         )
 
     def _calc_portfolio_var(self, nav: float, open_positions: list[dict], price_data: dict) -> float:

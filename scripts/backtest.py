@@ -24,6 +24,7 @@ warnings.filterwarnings("ignore")
 
 import time
 from datetime import datetime
+from itertools import combinations
 
 import httpx
 import numpy as np
@@ -35,19 +36,43 @@ from app.services import stats_engine, risk_engine
 # ---------------------------------------------------------------------
 # CONFIG — edit these to match your candidate universe / thresholds
 # ---------------------------------------------------------------------
-CANDIDATE_PAIRS = [
-    ("KO", "PEP"),
-    ("XOM", "CVX"),
-    ("V", "MA"),
-    ("HD", "LOW"),
-]
+SECTOR_UNIVERSE = {
+    "consumer_staples": ["KO", "PEP", "PG", "CL", "COST", "WMT", "KMB", "CLX", "GIS", "KHC"],
+    "energy": ["XOM", "CVX", "COP", "EOG", "SLB", "PSX", "VLO", "MPC", "OXY", "HES"],
+    "payments": ["V", "MA", "PYPL", "FIS", "FI", "GPN"],
+    "retail": ["HD", "LOW", "TGT", "WMT", "TJX", "ROST", "DG", "DLTR", "BBY"],
+    "banks": ["JPM", "BAC", "GS", "MS", "WFC", "USB", "PNC", "TFC", "C", "COF"],
+    "healthcare": ["JNJ", "PFE", "UNH", "CVS", "MRK", "ABBV", "BMY", "LLY", "CI", "HUM"],
+    "semis": ["QCOM", "AVGO", "TXN", "ADI", "MU", "NXPI", "MCHP", "ON"],
+    "airlines": ["DAL", "UAL", "AAL", "LUV", "ALK", "JBLU"],
+    "telecom": ["VZ", "T", "TMUS"],
+    "industrials": ["HON", "GE", "MMM", "EMR", "ITW", "ETN", "PH", "ROK"],
+    "reits": ["O", "SPG", "PLD", "AMT", "EQIX", "PSA", "DLR", "WELL"],
+    "insurance": ["TRV", "ALL", "PGR", "CB", "AIG", "MET", "PRU"],
+    "asset_managers": ["BLK", "BX", "KKR", "APO", "TROW", "BEN"],
+    "autos": ["GM", "F", "STLA"],
+    "beverages_alcohol": ["STZ", "BF-B", "TAP"],
+}
+
+
+def generate_candidate_pairs(sector_universe: dict[str, list[str]]) -> list[tuple[str, str]]:
+    """All unique intra-sector combinations — cointegration is only economically
+    plausible within a sector, so we don't generate cross-sector pairs."""
+    pairs = []
+    for sector, tickers in sector_universe.items():
+        for a, b in combinations(sorted(set(tickers)), 2):
+            pairs.append((a, b))
+    return pairs
+
+
+CANDIDATE_PAIRS = generate_candidate_pairs(SECTOR_UNIVERSE)
 
 START_DATE = "2021-01-01"
 END_DATE = "2026-01-01"
 
-LOOKBACK_WINDOW = 60       # trading days used for cointegration/hedge ratio re-fit
-ZSCORE_LOOKBACK = 20       # trading days for rolling z-score mean/std
-STEP_DAYS = 1              # re-evaluate every N trading days (1 = every day)
+LOOKBACK_WINDOW = 100
+ZSCORE_LOOKBACK = 20
+STEP_DAYS = 1
 
 COINTEGRATION_PVALUE_MAX = 0.05
 HALF_LIFE_MAX_DAYS = 30
@@ -55,10 +80,11 @@ ZSCORE_ENTRY = 2.0
 ZSCORE_EXIT = 0.5
 ZSCORE_STOP = 3.5
 
+CONSECUTIVE_BREAKS_TO_EXIT = 3
+
 INITIAL_CAPITAL = 100_000
-RISK_PCT_PER_TRADE = 0.01   # matches max_risk_pct_per_trade default
-STOP_LOSS_PCT = 0.02        # hard $ stop = 2% adverse move on leg A, matches
-                             # the live agent's stop_distance placeholder
+RISK_PCT_PER_TRADE = 0.01
+STOP_LOSS_PCT = 0.02
 
 
 # ---------------------------------------------------------------------
@@ -90,8 +116,10 @@ def load_price_data(tickers: list[str]) -> dict[str, pd.Series]:
     print(f"Downloading {len(tickers)} tickers from {START_DATE} to {END_DATE}...")
     series_map: dict[str, pd.Series] = {}
     for i, ticker in enumerate(tickers):
+        if i > 0 and i % 10 == 0:
+            print(f"  ... {i}/{len(tickers)} tickers loaded")
         if i > 0:
-            time.sleep(0.5)
+            time.sleep(0.35)
         loaded = False
         for attempt in range(3):
             try:
@@ -101,7 +129,8 @@ def load_price_data(tickers: list[str]) -> dict[str, pd.Series]:
                     loaded = True
                     break
             except Exception as exc:
-                print(f"  chart API attempt {attempt + 1} failed for {ticker}: {exc}")
+                if attempt == 2:
+                    print(f"  chart API failed for {ticker}: {exc}")
                 time.sleep(1 * (attempt + 1))
         if not loaded:
             try:
@@ -110,8 +139,8 @@ def load_price_data(tickers: list[str]) -> dict[str, pd.Series]:
                     close_col = "Close" if "Close" in data.columns else "close"
                     series_map[ticker] = data[close_col].dropna()
                     loaded = True
-            except Exception as exc:
-                print(f"  yfinance failed for {ticker}: {exc}")
+            except Exception:
+                pass
         if not loaded:
             print(f"  WARNING: no data for {ticker}")
     return series_map
@@ -123,7 +152,7 @@ def load_price_data(tickers: list[str]) -> dict[str, pd.Series]:
 class PairPosition:
     def __init__(self):
         self.is_open = False
-        self.direction = None      # "LONG_SPREAD" or "SHORT_SPREAD"
+        self.direction = None
         self.entry_z = None
         self.entry_date = None
         self.entry_spread = None
@@ -132,19 +161,23 @@ class PairPosition:
         self.shares_b = None
         self.entry_price_a = None
         self.entry_price_b = None
-        self.dollar_stop_price_a = None  # hard $ stop level on leg A
+        self.dollar_stop_price_a = None
+        self.consecutive_breaks = 0
 
 
 def run_backtest():
     all_series = load_price_data(sorted({t for pair in CANDIDATE_PAIRS for t in pair}))
+    print(f"Running walk-forward backtest on {len(CANDIDATE_PAIRS)} intra-sector pairs...")
 
     results = []
     trade_log = []
 
-    for pair_a, pair_b in CANDIDATE_PAIRS:
+    for pair_idx, (pair_a, pair_b) in enumerate(CANDIDATE_PAIRS, start=1):
         if pair_a not in all_series or pair_b not in all_series:
-            print(f"Skipping {pair_a}/{pair_b}: missing ticker data")
             continue
+
+        if pair_idx % 25 == 0:
+            print(f"  pair {pair_idx}/{len(CANDIDATE_PAIRS)}: {pair_a}/{pair_b}")
 
         series_a_full = all_series[pair_a]
         series_b_full = all_series[pair_b]
@@ -154,7 +187,6 @@ def run_backtest():
         series_b_full = series_b_full.loc[common_idx]
 
         if len(common_idx) < LOOKBACK_WINDOW + ZSCORE_LOOKBACK + 10:
-            print(f"Skipping {pair_a}/{pair_b}: not enough overlapping history")
             continue
 
         position = PairPosition()
@@ -164,7 +196,6 @@ def run_backtest():
         equity_curve = []
         pnl_total = 0.0
 
-        # walk forward day by day, only using data up to "today" (no lookahead)
         for i in range(LOOKBACK_WINDOW + ZSCORE_LOOKBACK, len(common_idx), STEP_DAYS):
             today = common_idx[i]
             window_a = series_a_full.iloc[max(0, i - LOOKBACK_WINDOW):i + 1]
@@ -177,43 +208,36 @@ def run_backtest():
             except Exception:
                 continue
 
-            try:
-                hedge_result = stats_engine.compute_hedge_ratio_kalman(
-                    window_a, window_b, pair_a, pair_b, prev_hedge_ratio
-                )
-            except Exception:
-                continue
-            prev_hedge_ratio = hedge_result.hedge_ratio
-
-            spread = window_a - hedge_result.hedge_ratio * window_b
-            if len(spread) < ZSCORE_LOOKBACK:
-                continue
-            z = stats_engine.calc_zscore(spread, lookback=ZSCORE_LOOKBACK)
-            if np.isnan(z):
-                continue
-
             price_a_today = window_a.iloc[-1]
             price_b_today = window_b.iloc[-1]
 
-            # --- HARD STOPS CHECKED FIRST, regardless of cointegration status ---
+            z = None
+            hedge_result = None
+            if coint_result.is_cointegrated:
+                try:
+                    hedge_result = stats_engine.compute_hedge_ratio_kalman(
+                        window_a, window_b, pair_a, pair_b, prev_hedge_ratio
+                    )
+                    prev_hedge_ratio = hedge_result.hedge_ratio
+                    spread = window_a - hedge_result.hedge_ratio * window_b
+                    if len(spread) >= ZSCORE_LOOKBACK:
+                        z_val = stats_engine.calc_zscore(spread, lookback=ZSCORE_LOOKBACK)
+                        if not np.isnan(z_val):
+                            z = z_val
+                except Exception:
+                    pass
+
             if position.is_open:
                 hit_dollar_stop = _check_dollar_stop(position, price_a_today)
+                hit_zscore_stop = z is not None and abs(z) >= ZSCORE_STOP
+                hit_target = z is not None and abs(z) <= ZSCORE_EXIT
 
-                z = None
-                if coint_result.is_cointegrated:
-                    try:
-                        hedge_result = stats_engine.compute_hedge_ratio_kalman(
-                            window_a, window_b, pair_a, pair_b, prev_hedge_ratio
-                        )
-                        prev_hedge_ratio = hedge_result.hedge_ratio
-                        spread = window_a - hedge_result.hedge_ratio * window_b
-                        if len(spread) >= ZSCORE_LOOKBACK:
-                            z = stats_engine.calc_zscore(spread, lookback=ZSCORE_LOOKBACK)
-                    except Exception:
-                        z = None
+                if not coint_result.is_cointegrated:
+                    position.consecutive_breaks += 1
+                else:
+                    position.consecutive_breaks = 0
 
-                hit_zscore_stop = z is not None and not np.isnan(z) and abs(z) >= ZSCORE_STOP
-                hit_target = z is not None and not np.isnan(z) and abs(z) <= ZSCORE_EXIT
+                hit_coint_break = position.consecutive_breaks >= CONSECUTIVE_BREAKS_TO_EXIT
 
                 if hit_dollar_stop or hit_zscore_stop:
                     pnl = _close_position(position, price_a_today, price_b_today)
@@ -224,8 +248,6 @@ def run_backtest():
                         "reason": reason, "pnl": pnl, "exit_z": z,
                     })
                     position = PairPosition()
-                    equity_curve.append({"date": today, "cum_pnl": pnl_total})
-                    continue
                 elif hit_target:
                     pnl = _close_position(position, price_a_today, price_b_today)
                     pnl_total += pnl
@@ -234,9 +256,7 @@ def run_backtest():
                         "reason": "target", "pnl": pnl, "exit_z": z,
                     })
                     position = PairPosition()
-                    equity_curve.append({"date": today, "cum_pnl": pnl_total})
-                    continue
-                elif not coint_result.is_cointegrated:
+                elif hit_coint_break:
                     pnl = _close_position(position, price_a_today, price_b_today)
                     pnl_total += pnl
                     trade_log.append({
@@ -244,67 +264,50 @@ def run_backtest():
                         "reason": "cointegration_broke", "pnl": pnl, "exit_z": z,
                     })
                     position = PairPosition()
-                    equity_curve.append({"date": today, "cum_pnl": pnl_total})
-                    continue
 
-            if not coint_result.is_cointegrated:
+                equity_curve.append({"date": today, "cum_pnl": pnl_total})
                 continue
 
-            try:
-                hedge_result = stats_engine.compute_hedge_ratio_kalman(
-                    window_a, window_b, pair_a, pair_b, prev_hedge_ratio
-                )
-            except Exception:
-                continue
-            prev_hedge_ratio = hedge_result.hedge_ratio
+            if coint_result.is_cointegrated and hedge_result is not None and z is not None:
+                if abs(z) >= ZSCORE_ENTRY:
+                    position.is_open = True
+                    position.direction = "LONG_SPREAD" if z < 0 else "SHORT_SPREAD"
+                    position.entry_z = z
+                    position.entry_date = today
+                    position.hedge_ratio_at_entry = hedge_result.hedge_ratio
+                    position.entry_price_a = price_a_today
+                    position.entry_price_b = price_b_today
+                    position.consecutive_breaks = 0
 
-            spread = window_a - hedge_result.hedge_ratio * window_b
-            if len(spread) < ZSCORE_LOOKBACK:
-                continue
-            z = stats_engine.calc_zscore(spread, lookback=ZSCORE_LOOKBACK)
-            if np.isnan(z):
-                continue
+                    stop_distance = price_a_today * STOP_LOSS_PCT
+                    shares_a = risk_engine.calc_position_size(
+                        INITIAL_CAPITAL, RISK_PCT_PER_TRADE, stop_distance, price_a_today
+                    )
+                    position.shares_a = shares_a
+                    position.shares_b = shares_a * hedge_result.hedge_ratio
+                    if position.direction == "LONG_SPREAD":
+                        position.dollar_stop_price_a = price_a_today - stop_distance
+                    else:
+                        position.dollar_stop_price_a = price_a_today + stop_distance
 
-            if not position.is_open and abs(z) >= ZSCORE_ENTRY:
-                position.is_open = True
-                position.direction = "LONG_SPREAD" if z < 0 else "SHORT_SPREAD"
-                position.entry_z = z
-                position.entry_date = today
-                position.entry_spread = spread.iloc[-1]
-                position.hedge_ratio_at_entry = hedge_result.hedge_ratio
-                position.entry_price_a = price_a_today
-                position.entry_price_b = price_b_today
-
-                stop_distance = price_a_today * STOP_LOSS_PCT
-                shares_a = risk_engine.calc_position_size(
-                    INITIAL_CAPITAL, RISK_PCT_PER_TRADE, stop_distance, price_a_today
-                )
-                position.shares_a = shares_a
-                position.shares_b = shares_a * hedge_result.hedge_ratio
-                if position.direction == "LONG_SPREAD":
-                    position.dollar_stop_price_a = price_a_today - stop_distance
-                else:
-                    position.dollar_stop_price_a = price_a_today + stop_distance
-
-                pair_trades += 1
+                    pair_trades += 1
 
             equity_curve.append({"date": today, "cum_pnl": pnl_total})
 
-        results.append({
-            "pair": f"{pair_a}/{pair_b}",
-            "signals_evaluated": pair_signals_evaluated,
-            "trades_entered": pair_trades,
-            "total_pnl": pnl_total,
-            "equity_curve": equity_curve,
-        })
+        if pair_trades > 0 or pnl_total != 0:
+            results.append({
+                "pair": f"{pair_a}/{pair_b}",
+                "signals_evaluated": pair_signals_evaluated,
+                "trades_entered": pair_trades,
+                "total_pnl": pnl_total,
+                "equity_curve": equity_curve,
+            })
 
     _print_summary(results, trade_log)
     return results, trade_log
 
 
 def _check_dollar_stop(position: PairPosition, price_a_today: float) -> bool:
-    """Hard $ stop on leg A's adverse move, matching the live agent's rule:
-    exit on whichever comes first — hard $ stop OR z-score stop."""
     if position.dollar_stop_price_a is None:
         return False
     if position.direction == "LONG_SPREAD":
@@ -314,9 +317,6 @@ def _check_dollar_stop(position: PairPosition, price_a_today: float) -> bool:
 
 
 def _close_position(position: PairPosition, price_a: float, price_b: float) -> float:
-    """P&L using the actual shares sized and locked in at entry (via
-    risk_engine.calc_position_size), not recomputed at exit. No
-    slippage/fees modeled."""
     shares_a = position.shares_a
     shares_b = position.shares_b
 
@@ -331,15 +331,21 @@ def _print_summary(results: list[dict], trade_log: list[dict]):
     print("\n" + "=" * 60)
     print("BACKTEST SUMMARY")
     print("=" * 60)
+    print(f"Pairs with activity: {len(results)} / {len(CANDIDATE_PAIRS)} candidate pairs")
 
     total_pnl = sum(r["total_pnl"] for r in results)
     total_trades = sum(r["trades_entered"] for r in results)
 
-    for r in results:
-        print(f"\n{r['pair']}")
-        print(f"  Signals evaluated: {r['signals_evaluated']}")
-        print(f"  Trades entered:    {r['trades_entered']}")
-        print(f"  Total P&L:         ${r['total_pnl']:,.2f}")
+    top = sorted(results, key=lambda r: r["total_pnl"], reverse=True)[:10]
+    bottom = sorted(results, key=lambda r: r["total_pnl"])[:10]
+
+    print("\nTop 10 pairs by P&L:")
+    for r in top:
+        print(f"  {r['pair']}: ${r['total_pnl']:,.2f} ({r['trades_entered']} trades)")
+
+    print("\nBottom 10 pairs by P&L:")
+    for r in bottom:
+        print(f"  {r['pair']}: ${r['total_pnl']:,.2f} ({r['trades_entered']} trades)")
 
     print("\n" + "-" * 60)
     print(f"TOTAL trades across all pairs: {total_trades}")
@@ -361,19 +367,17 @@ def _print_summary(results: list[dict], trade_log: list[dict]):
 
     print("\nSANITY CHECKS:")
     if total_trades == 0:
-        print("  WARNING: ZERO trades fired. Thresholds may be too strict, or no pairs")
-        print("     in your universe are actually cointegrated over this period.")
-    elif total_trades > 200:
-        print("  WARNING: Very high trade count — check for lookahead bias or thresholds")
-        print("     that are too loose before trusting this result.")
+        print("  WARNING: ZERO trades fired.")
+    elif total_trades > 500:
+        print(f"  WARNING: Very high trade count ({total_trades}).")
     else:
-        print(f"  Trade count ({total_trades}) is in a plausible range. Review")
-        print("  individual trade_log entries below before trusting P&L blindly.")
+        print(f"  Trade count ({total_trades}) — review top/bottom pairs before trusting P&L.")
 
     print("\n" + "=" * 60)
 
 
 if __name__ == "__main__":
+    print(f"Candidate pairs generated: {len(CANDIDATE_PAIRS)}")
     results, trade_log = run_backtest()
 
     if trade_log:

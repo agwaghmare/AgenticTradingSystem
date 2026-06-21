@@ -7,3 +7,5 @@ __pycache__/
 alembic/versions/__pycache__/
 alembic/__pycache__/
 scripts/backtest_trade_log.csv
+scripts/backtest_full_run.txt
+scripts/backtest_output.txt

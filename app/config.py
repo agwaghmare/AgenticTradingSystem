@@ -41,6 +41,7 @@ class Settings(BaseSettings):
     half_life_max_days: float = 30.0
     hedge_drift_max_pct: float = 0.20
     earnings_blackout_days: int = 1
+    consecutive_breaks_to_exit: int = 3
 
     # Z-score thresholds
     zscore_entry: float = 2.0

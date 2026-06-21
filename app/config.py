@@ -2,13 +2,22 @@ from pydantic_settings import BaseSettings
 
 
 class Settings(BaseSettings):
-    database_url: str
+    database_url: str = "postgresql+asyncpg://postgres:localpassword@localhost:5432/agentictradingsystem"
 
-    alpaca_api_key: str
-    alpaca_secret_key: str
+    alpaca_api_key: str = ""
+    alpaca_secret_key: str = ""
     alpaca_base_url: str = "https://paper-api.alpaca.markets"
 
-    anthropic_api_key: str
+    anthropic_api_key: str = ""
+    mistral_api_key: str = ""
+    finnhub_api_key: str = ""
+    discord_webhook_url: str = ""
+
+    # Data pipeline
+    price_history_days: int = 180
+    atr_period: int = 14
+    atr_stop_multiplier: float = 2.0
+    market_benchmark_ticker: str = "SPY"
 
     # Position limits
     max_nav_pct_per_name: float = 0.05

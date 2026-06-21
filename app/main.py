@@ -9,6 +9,7 @@ from app.api.routes import router
 from app.agents.trading_agent import TradingAgent
 from app.services.broker import BrokerClient
 from app.services.regime import RegimeDetector
+from app.services import data_pipeline
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("main")
@@ -18,15 +19,21 @@ broker = BrokerClient()
 regime_detector = RegimeDetector()
 agent = TradingAgent(broker, regime_detector)
 
-# Replace with real universe + data pipeline
-CANDIDATE_PAIRS = [("KO", "PEP"), ("XOM", "CVX")]
+CANDIDATE_PAIRS = [
+    ("KO", "PEP"),
+    ("XOM", "CVX"),
+    ("HD", "LOW"),
+    ("V", "MA"),
+    ("GLD", "GDX"),
+]
 
 
 async def scheduled_cycle():
     async with AsyncSessionLocal() as db:
         try:
-            # TODO: replace with real price_data / market_returns fetch
-            await agent.run_cycle(db, CANDIDATE_PAIRS, price_data={}, market_returns=None)
+            price_data = await data_pipeline.get_latest_prices(db, CANDIDATE_PAIRS)
+            market_returns = await data_pipeline.get_market_returns(db)
+            await agent.run_cycle(db, CANDIDATE_PAIRS, price_data, market_returns)
         except Exception:
             logger.exception("Agent cycle failed")
 

@@ -1,35 +1,34 @@
 """
-LLM explainer layer for the trading agent.
+Mistral version of the LLM explainer layer.
 
-IMPORTANT: This module is read-only with respect to trading. It NEVER places
-orders, NEVER influences risk checks, and NEVER changes agent behavior. It
-only narrates decisions that the deterministic TradingAgent has already made
-and logged. Keeping this strictly downstream of execution preserves the
-auditability and determinism of the core system.
-
-Two use cases:
-1. narrate_cycle()  - turn one cycle's structured decisions into a plain-
-   English summary (for a dashboard, Slack message, or daily digest).
-2. review_decisions() - batch-review a window of decision_log rows and flag
-   anything that looks anomalous, for human review only.
+Read-only convenience layer — never places orders or influences trading.
 """
 
 import json
-from anthropic import Anthropic
+import logging
 
 from app.config import settings
 
-client = Anthropic(api_key=settings.anthropic_api_key)
+logger = logging.getLogger("llm_explainer")
 
-MODEL = "claude-sonnet-4-6"
+try:
+    from mistralai import Mistral
+
+    client = Mistral(api_key=settings.mistral_api_key) if settings.mistral_api_key else None
+except ImportError:
+    client = None
+
+MODEL = "mistral-small-latest"
+
+
+def _llm_unavailable() -> str:
+    return "LLM explainer unavailable: set MISTRAL_API_KEY in .env to enable narration."
 
 
 def narrate_cycle(decisions: list[dict], risk_snapshot: dict) -> str:
-    """
-    decisions: list of decision_log rows (as dicts) from one cycle_id.
-    risk_snapshot: the risk_snapshot row for that same cycle.
-    Returns a short plain-English summary suitable for a Slack/email digest.
-    """
+    if client is None:
+        return _llm_unavailable()
+
     prompt = f"""You are summarizing one trading cycle for a human reviewing
 a systematic pairs-trading agent. You are NOT making trading decisions —
 the decisions below have already been made and executed by deterministic
@@ -51,7 +50,7 @@ Write a concise summary (under 150 words):
 Do not recommend trades. Do not second-guess the risk engine's rules. Just
 report what happened and surface anything noteworthy."""
 
-    response = client.messages.create(
+    response = client.chat.complete(
         model=MODEL,
         max_tokens=500,
         messages=[{"role": "user", "content": prompt}],
@@ -60,10 +59,9 @@ report what happened and surface anything noteworthy."""
 
 
 def review_decisions(decisions: list[dict], window_label: str = "last 24h") -> str:
-    """
-    Batch review for anomaly detection. Intended to run periodically
-    (e.g. daily cron), not per-cycle. Flags patterns for human review only.
-    """
+    if client is None:
+        return _llm_unavailable()
+
     prompt = f"""You are reviewing a batch of trading-agent decision logs from
 the {window_label} for a systematic pairs-trading desk. These decisions were
 made by deterministic risk-rule code, not by you. Your job is purely
@@ -84,7 +82,7 @@ Output a short bulleted list of findings. If nothing stands out, say so
 plainly rather than manufacturing a concern. Do not suggest changing risk
 thresholds — flag for human review only."""
 
-    response = client.messages.create(
+    response = client.chat.complete(
         model=MODEL,
         max_tokens=600,
         messages=[{"role": "user", "content": prompt}],
@@ -93,4 +91,4 @@ thresholds — flag for human review only."""
 
 
 def _extract_text(response) -> str:
-    return "".join(block.text for block in response.content if block.type == "text")
+    return response.choices[0].message.content.strip()

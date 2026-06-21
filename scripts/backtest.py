@@ -1,0 +1,383 @@
+"""
+Backtest script for the mean-reversion pairs strategy.
+
+Replays the SAME logic the live agent uses (app/services/stats_engine.py),
+day by day, over historical data — using only data available up to each
+simulated "today" (no lookahead). Outputs: how many signals fired, what
+the hypothetical trades would have looked like, and simple P&L stats.
+
+This does NOT touch Alpaca, Robinhood, or any broker. It only uses yfinance
+for historical data and reuses your real stats_engine.py logic, so a good
+backtest result here means the actual agent logic is producing sane
+signals — not a separate, simplified approximation of it.
+
+Run from the project root:
+    python scripts/backtest.py
+"""
+
+import sys
+import os
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+import warnings
+warnings.filterwarnings("ignore")
+
+import time
+from datetime import datetime
+
+import httpx
+import numpy as np
+import pandas as pd
+import yfinance as yf
+
+from app.services import stats_engine, risk_engine
+
+# ---------------------------------------------------------------------
+# CONFIG — edit these to match your candidate universe / thresholds
+# ---------------------------------------------------------------------
+CANDIDATE_PAIRS = [
+    ("KO", "PEP"),
+    ("XOM", "CVX"),
+    ("V", "MA"),
+    ("HD", "LOW"),
+]
+
+START_DATE = "2021-01-01"
+END_DATE = "2026-01-01"
+
+LOOKBACK_WINDOW = 60       # trading days used for cointegration/hedge ratio re-fit
+ZSCORE_LOOKBACK = 20       # trading days for rolling z-score mean/std
+STEP_DAYS = 1              # re-evaluate every N trading days (1 = every day)
+
+COINTEGRATION_PVALUE_MAX = 0.05
+HALF_LIFE_MAX_DAYS = 30
+ZSCORE_ENTRY = 2.0
+ZSCORE_EXIT = 0.5
+ZSCORE_STOP = 3.5
+
+INITIAL_CAPITAL = 100_000
+RISK_PCT_PER_TRADE = 0.01   # matches max_risk_pct_per_trade default
+STOP_LOSS_PCT = 0.02        # hard $ stop = 2% adverse move on leg A, matches
+                             # the live agent's stop_distance placeholder
+
+
+# ---------------------------------------------------------------------
+# DATA LOADING
+# ---------------------------------------------------------------------
+def _load_via_chart_api(ticker: str) -> pd.Series:
+    start_ts = int(datetime.strptime(START_DATE, "%Y-%m-%d").timestamp())
+    end_ts = int(datetime.strptime(END_DATE, "%Y-%m-%d").timestamp())
+    url = f"https://query1.finance.yahoo.com/v8/finance/chart/{ticker}"
+    response = httpx.get(
+        url,
+        params={"period1": start_ts, "period2": end_ts, "interval": "1d", "events": "history"},
+        headers={"User-Agent": "Mozilla/5.0"},
+        timeout=30,
+    )
+    response.raise_for_status()
+    result = response.json()["chart"]["result"][0]
+    timestamps = result["timestamp"]
+    closes = result["indicators"]["quote"][0]["close"]
+    data = {
+        pd.Timestamp(ts, unit="s", tz="UTC").tz_localize(None): close
+        for ts, close in zip(timestamps, closes)
+        if close is not None
+    }
+    return pd.Series(data).sort_index()
+
+
+def load_price_data(tickers: list[str]) -> dict[str, pd.Series]:
+    print(f"Downloading {len(tickers)} tickers from {START_DATE} to {END_DATE}...")
+    series_map: dict[str, pd.Series] = {}
+    for i, ticker in enumerate(tickers):
+        if i > 0:
+            time.sleep(0.5)
+        loaded = False
+        for attempt in range(3):
+            try:
+                s = _load_via_chart_api(ticker)
+                if not s.empty:
+                    series_map[ticker] = s
+                    loaded = True
+                    break
+            except Exception as exc:
+                print(f"  chart API attempt {attempt + 1} failed for {ticker}: {exc}")
+                time.sleep(1 * (attempt + 1))
+        if not loaded:
+            try:
+                data = yf.download(ticker, start=START_DATE, end=END_DATE, progress=False)
+                if not data.empty:
+                    close_col = "Close" if "Close" in data.columns else "close"
+                    series_map[ticker] = data[close_col].dropna()
+                    loaded = True
+            except Exception as exc:
+                print(f"  yfinance failed for {ticker}: {exc}")
+        if not loaded:
+            print(f"  WARNING: no data for {ticker}")
+    return series_map
+
+
+# ---------------------------------------------------------------------
+# SIMULATED TRADE STATE
+# ---------------------------------------------------------------------
+class PairPosition:
+    def __init__(self):
+        self.is_open = False
+        self.direction = None      # "LONG_SPREAD" or "SHORT_SPREAD"
+        self.entry_z = None
+        self.entry_date = None
+        self.entry_spread = None
+        self.hedge_ratio_at_entry = None
+        self.shares_a = None
+        self.shares_b = None
+        self.entry_price_a = None
+        self.entry_price_b = None
+        self.dollar_stop_price_a = None  # hard $ stop level on leg A
+
+
+def run_backtest():
+    all_series = load_price_data(sorted({t for pair in CANDIDATE_PAIRS for t in pair}))
+
+    results = []
+    trade_log = []
+
+    for pair_a, pair_b in CANDIDATE_PAIRS:
+        if pair_a not in all_series or pair_b not in all_series:
+            print(f"Skipping {pair_a}/{pair_b}: missing ticker data")
+            continue
+
+        series_a_full = all_series[pair_a]
+        series_b_full = all_series[pair_b]
+
+        common_idx = series_a_full.index.intersection(series_b_full.index)
+        series_a_full = series_a_full.loc[common_idx]
+        series_b_full = series_b_full.loc[common_idx]
+
+        if len(common_idx) < LOOKBACK_WINDOW + ZSCORE_LOOKBACK + 10:
+            print(f"Skipping {pair_a}/{pair_b}: not enough overlapping history")
+            continue
+
+        position = PairPosition()
+        prev_hedge_ratio = None
+        pair_trades = 0
+        pair_signals_evaluated = 0
+        equity_curve = []
+        pnl_total = 0.0
+
+        # walk forward day by day, only using data up to "today" (no lookahead)
+        for i in range(LOOKBACK_WINDOW + ZSCORE_LOOKBACK, len(common_idx), STEP_DAYS):
+            today = common_idx[i]
+            window_a = series_a_full.iloc[max(0, i - LOOKBACK_WINDOW):i + 1]
+            window_b = series_b_full.iloc[max(0, i - LOOKBACK_WINDOW):i + 1]
+
+            pair_signals_evaluated += 1
+
+            try:
+                coint_result = stats_engine.check_cointegration(window_a, window_b, pair_a, pair_b)
+            except Exception:
+                continue
+
+            try:
+                hedge_result = stats_engine.compute_hedge_ratio_kalman(
+                    window_a, window_b, pair_a, pair_b, prev_hedge_ratio
+                )
+            except Exception:
+                continue
+            prev_hedge_ratio = hedge_result.hedge_ratio
+
+            spread = window_a - hedge_result.hedge_ratio * window_b
+            if len(spread) < ZSCORE_LOOKBACK:
+                continue
+            z = stats_engine.calc_zscore(spread, lookback=ZSCORE_LOOKBACK)
+            if np.isnan(z):
+                continue
+
+            price_a_today = window_a.iloc[-1]
+            price_b_today = window_b.iloc[-1]
+
+            # --- HARD STOPS CHECKED FIRST, regardless of cointegration status ---
+            if position.is_open:
+                hit_dollar_stop = _check_dollar_stop(position, price_a_today)
+
+                z = None
+                if coint_result.is_cointegrated:
+                    try:
+                        hedge_result = stats_engine.compute_hedge_ratio_kalman(
+                            window_a, window_b, pair_a, pair_b, prev_hedge_ratio
+                        )
+                        prev_hedge_ratio = hedge_result.hedge_ratio
+                        spread = window_a - hedge_result.hedge_ratio * window_b
+                        if len(spread) >= ZSCORE_LOOKBACK:
+                            z = stats_engine.calc_zscore(spread, lookback=ZSCORE_LOOKBACK)
+                    except Exception:
+                        z = None
+
+                hit_zscore_stop = z is not None and not np.isnan(z) and abs(z) >= ZSCORE_STOP
+                hit_target = z is not None and not np.isnan(z) and abs(z) <= ZSCORE_EXIT
+
+                if hit_dollar_stop or hit_zscore_stop:
+                    pnl = _close_position(position, price_a_today, price_b_today)
+                    pnl_total += pnl
+                    reason = "dollar_stop" if hit_dollar_stop else "zscore_stop"
+                    trade_log.append({
+                        "pair": f"{pair_a}/{pair_b}", "exit_date": today,
+                        "reason": reason, "pnl": pnl, "exit_z": z,
+                    })
+                    position = PairPosition()
+                    equity_curve.append({"date": today, "cum_pnl": pnl_total})
+                    continue
+                elif hit_target:
+                    pnl = _close_position(position, price_a_today, price_b_today)
+                    pnl_total += pnl
+                    trade_log.append({
+                        "pair": f"{pair_a}/{pair_b}", "exit_date": today,
+                        "reason": "target", "pnl": pnl, "exit_z": z,
+                    })
+                    position = PairPosition()
+                    equity_curve.append({"date": today, "cum_pnl": pnl_total})
+                    continue
+                elif not coint_result.is_cointegrated:
+                    pnl = _close_position(position, price_a_today, price_b_today)
+                    pnl_total += pnl
+                    trade_log.append({
+                        "pair": f"{pair_a}/{pair_b}", "exit_date": today,
+                        "reason": "cointegration_broke", "pnl": pnl, "exit_z": z,
+                    })
+                    position = PairPosition()
+                    equity_curve.append({"date": today, "cum_pnl": pnl_total})
+                    continue
+
+            if not coint_result.is_cointegrated:
+                continue
+
+            try:
+                hedge_result = stats_engine.compute_hedge_ratio_kalman(
+                    window_a, window_b, pair_a, pair_b, prev_hedge_ratio
+                )
+            except Exception:
+                continue
+            prev_hedge_ratio = hedge_result.hedge_ratio
+
+            spread = window_a - hedge_result.hedge_ratio * window_b
+            if len(spread) < ZSCORE_LOOKBACK:
+                continue
+            z = stats_engine.calc_zscore(spread, lookback=ZSCORE_LOOKBACK)
+            if np.isnan(z):
+                continue
+
+            if not position.is_open and abs(z) >= ZSCORE_ENTRY:
+                position.is_open = True
+                position.direction = "LONG_SPREAD" if z < 0 else "SHORT_SPREAD"
+                position.entry_z = z
+                position.entry_date = today
+                position.entry_spread = spread.iloc[-1]
+                position.hedge_ratio_at_entry = hedge_result.hedge_ratio
+                position.entry_price_a = price_a_today
+                position.entry_price_b = price_b_today
+
+                stop_distance = price_a_today * STOP_LOSS_PCT
+                shares_a = risk_engine.calc_position_size(
+                    INITIAL_CAPITAL, RISK_PCT_PER_TRADE, stop_distance, price_a_today
+                )
+                position.shares_a = shares_a
+                position.shares_b = shares_a * hedge_result.hedge_ratio
+                if position.direction == "LONG_SPREAD":
+                    position.dollar_stop_price_a = price_a_today - stop_distance
+                else:
+                    position.dollar_stop_price_a = price_a_today + stop_distance
+
+                pair_trades += 1
+
+            equity_curve.append({"date": today, "cum_pnl": pnl_total})
+
+        results.append({
+            "pair": f"{pair_a}/{pair_b}",
+            "signals_evaluated": pair_signals_evaluated,
+            "trades_entered": pair_trades,
+            "total_pnl": pnl_total,
+            "equity_curve": equity_curve,
+        })
+
+    _print_summary(results, trade_log)
+    return results, trade_log
+
+
+def _check_dollar_stop(position: PairPosition, price_a_today: float) -> bool:
+    """Hard $ stop on leg A's adverse move, matching the live agent's rule:
+    exit on whichever comes first — hard $ stop OR z-score stop."""
+    if position.dollar_stop_price_a is None:
+        return False
+    if position.direction == "LONG_SPREAD":
+        return price_a_today <= position.dollar_stop_price_a
+    else:
+        return price_a_today >= position.dollar_stop_price_a
+
+
+def _close_position(position: PairPosition, price_a: float, price_b: float) -> float:
+    """P&L using the actual shares sized and locked in at entry (via
+    risk_engine.calc_position_size), not recomputed at exit. No
+    slippage/fees modeled."""
+    shares_a = position.shares_a
+    shares_b = position.shares_b
+
+    if position.direction == "LONG_SPREAD":
+        pnl = shares_a * (price_a - position.entry_price_a) - shares_b * (price_b - position.entry_price_b)
+    else:
+        pnl = -shares_a * (price_a - position.entry_price_a) + shares_b * (price_b - position.entry_price_b)
+    return float(pnl)
+
+
+def _print_summary(results: list[dict], trade_log: list[dict]):
+    print("\n" + "=" * 60)
+    print("BACKTEST SUMMARY")
+    print("=" * 60)
+
+    total_pnl = sum(r["total_pnl"] for r in results)
+    total_trades = sum(r["trades_entered"] for r in results)
+
+    for r in results:
+        print(f"\n{r['pair']}")
+        print(f"  Signals evaluated: {r['signals_evaluated']}")
+        print(f"  Trades entered:    {r['trades_entered']}")
+        print(f"  Total P&L:         ${r['total_pnl']:,.2f}")
+
+    print("\n" + "-" * 60)
+    print(f"TOTAL trades across all pairs: {total_trades}")
+    print(f"TOTAL P&L:                     ${total_pnl:,.2f}")
+    print(f"Return on initial capital:     {(total_pnl / INITIAL_CAPITAL) * 100:.2f}%")
+
+    if trade_log:
+        wins = [t for t in trade_log if t["pnl"] > 0]
+        losses = [t for t in trade_log if t["pnl"] <= 0]
+        win_rate = len(wins) / len(trade_log) * 100 if trade_log else 0
+        print(f"Win rate:                      {win_rate:.1f}% ({len(wins)}W / {len(losses)}L)")
+
+        print("\nExit reason breakdown:")
+        reasons = {}
+        for t in trade_log:
+            reasons[t["reason"]] = reasons.get(t["reason"], 0) + 1
+        for reason, count in sorted(reasons.items(), key=lambda x: -x[1]):
+            print(f"  {reason}: {count}")
+
+    print("\nSANITY CHECKS:")
+    if total_trades == 0:
+        print("  WARNING: ZERO trades fired. Thresholds may be too strict, or no pairs")
+        print("     in your universe are actually cointegrated over this period.")
+    elif total_trades > 200:
+        print("  WARNING: Very high trade count — check for lookahead bias or thresholds")
+        print("     that are too loose before trusting this result.")
+    else:
+        print(f"  Trade count ({total_trades}) is in a plausible range. Review")
+        print("  individual trade_log entries below before trusting P&L blindly.")
+
+    print("\n" + "=" * 60)
+
+
+if __name__ == "__main__":
+    results, trade_log = run_backtest()
+
+    if trade_log:
+        df = pd.DataFrame(trade_log)
+        out_path = os.path.join(os.path.dirname(__file__), "backtest_trade_log.csv")
+        df.to_csv(out_path, index=False)
+        print(f"\nFull trade log written to: {out_path}")

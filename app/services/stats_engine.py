@@ -6,6 +6,7 @@ from statsmodels.tools import add_constant
 from pykalman import KalmanFilter
 
 from app.models.schemas import CointegrationResult, HedgeRatioResult
+from app.config import settings
 
 
 def check_cointegration(series_a: pd.Series, series_b: pd.Series, pair_a: str, pair_b: str) -> CointegrationResult:
@@ -25,7 +26,8 @@ def check_cointegration(series_a: pd.Series, series_b: pd.Series, pair_a: str, p
         pair_b=pair_b,
         p_value=float(p_value),
         half_life_days=float(half_life),
-        is_cointegrated=p_value < 0.05 and 0 < half_life < 30,
+        is_cointegrated=p_value < settings.cointegration_pvalue_max
+        and 0 < half_life < settings.half_life_max_days,
     )
 
 
@@ -76,3 +78,21 @@ def calc_zscore(spread: pd.Series, lookback: int = 20) -> float:
     rolling_std = spread.rolling(lookback).std()
     z = (spread - rolling_mean) / rolling_std
     return float(z.iloc[-1])
+
+
+def calc_atr(high: pd.Series, low: pd.Series, close: pd.Series, period: int = 14) -> float:
+    """Average True Range over `period` bars."""
+    prev_close = close.shift(1)
+    tr = pd.concat(
+        [
+            high - low,
+            (high - prev_close).abs(),
+            (low - prev_close).abs(),
+        ],
+        axis=1,
+    ).max(axis=1)
+    atr = tr.rolling(period).mean()
+    value = float(atr.iloc[-1])
+    if pd.isna(value) or value <= 0:
+        return float(close.iloc[-1] * 0.02)
+    return value

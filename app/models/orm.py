@@ -89,3 +89,26 @@ class ModelPerformance(Base):
     sharpe_10d: Mapped[float | None] = mapped_column(Numeric(8, 4))
     sharpe_60d: Mapped[float | None] = mapped_column(Numeric(8, 4))
     flagged_decay: Mapped[bool] = mapped_column(Boolean, default=False)
+
+
+class PriceHistory(Base):
+    __tablename__ = "price_history"
+
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    ticker: Mapped[str] = mapped_column(String, nullable=False, index=True)
+    timestamp: Mapped[datetime] = mapped_column(TIMESTAMP(timezone=True), nullable=False, index=True)
+    interval: Mapped[str] = mapped_column(String, nullable=False, default="1d")
+    open: Mapped[float | None] = mapped_column(Numeric(16, 4))
+    high: Mapped[float | None] = mapped_column(Numeric(16, 4))
+    low: Mapped[float | None] = mapped_column(Numeric(16, 4))
+    close: Mapped[float] = mapped_column(Numeric(16, 4), nullable=False)
+    volume: Mapped[float | None] = mapped_column(Numeric(20, 2))
+
+
+class TickerMetadata(Base):
+    __tablename__ = "ticker_metadata"
+
+    ticker: Mapped[str] = mapped_column(String, primary_key=True)
+    sector: Mapped[str | None] = mapped_column(String)
+    industry: Mapped[str | None] = mapped_column(String)
+    updated_at: Mapped[datetime] = mapped_column(TIMESTAMP(timezone=True), default=datetime.utcnow)

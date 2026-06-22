@@ -24,7 +24,6 @@ warnings.filterwarnings("ignore")
 
 import time
 from datetime import datetime
-from itertools import combinations
 
 import httpx
 import numpy as np
@@ -32,40 +31,11 @@ import pandas as pd
 import yfinance as yf
 
 from app.services import stats_engine, risk_engine
+from app.pairs_universe import SECTOR_UNIVERSE, generate_candidate_pairs, CANDIDATE_PAIRS
 
 # ---------------------------------------------------------------------
-# CONFIG — edit these to match your candidate universe / thresholds
+# CONFIG — edit thresholds in app/config.py; universe in app/pairs_universe.py
 # ---------------------------------------------------------------------
-SECTOR_UNIVERSE = {
-    "consumer_staples": ["KO", "PEP", "PG", "CL", "COST", "WMT", "KMB", "CLX", "GIS", "KHC"],
-    "energy": ["XOM", "CVX", "COP", "EOG", "SLB", "PSX", "VLO", "MPC", "OXY", "HES"],
-    "payments": ["V", "MA", "PYPL", "FIS", "FI", "GPN"],
-    "retail": ["HD", "LOW", "TGT", "WMT", "TJX", "ROST", "DG", "DLTR", "BBY"],
-    "banks": ["JPM", "BAC", "GS", "MS", "WFC", "USB", "PNC", "TFC", "C", "COF"],
-    "healthcare": ["JNJ", "PFE", "UNH", "CVS", "MRK", "ABBV", "BMY", "LLY", "CI", "HUM"],
-    "semis": ["QCOM", "AVGO", "TXN", "ADI", "MU", "NXPI", "MCHP", "ON"],
-    "airlines": ["DAL", "UAL", "AAL", "LUV", "ALK", "JBLU"],
-    "telecom": ["VZ", "T", "TMUS"],
-    "industrials": ["HON", "GE", "MMM", "EMR", "ITW", "ETN", "PH", "ROK"],
-    "reits": ["O", "SPG", "PLD", "AMT", "EQIX", "PSA", "DLR", "WELL"],
-    "insurance": ["TRV", "ALL", "PGR", "CB", "AIG", "MET", "PRU"],
-    "asset_managers": ["BLK", "BX", "KKR", "APO", "TROW", "BEN"],
-    "autos": ["GM", "F", "STLA"],
-    "beverages_alcohol": ["STZ", "BF-B", "TAP"],
-}
-
-
-def generate_candidate_pairs(sector_universe: dict[str, list[str]]) -> list[tuple[str, str]]:
-    """All unique intra-sector combinations — cointegration is only economically
-    plausible within a sector, so we don't generate cross-sector pairs."""
-    pairs = []
-    for sector, tickers in sector_universe.items():
-        for a, b in combinations(sorted(set(tickers)), 2):
-            pairs.append((a, b))
-    return pairs
-
-
-CANDIDATE_PAIRS = generate_candidate_pairs(SECTOR_UNIVERSE)
 
 START_DATE = "2021-01-01"
 END_DATE = "2026-01-01"

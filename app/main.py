@@ -1,3 +1,4 @@
+import asyncio
 import logging
 from contextlib import asynccontextmanager
 
@@ -11,6 +12,8 @@ from app.services.broker import BrokerClient
 from app.services.regime import RegimeDetector
 from app.services import data_pipeline
 
+from app.pairs_universe import CANDIDATE_PAIRS
+
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("main")
 
@@ -19,13 +22,7 @@ broker = BrokerClient()
 regime_detector = RegimeDetector()
 agent = TradingAgent(broker, regime_detector)
 
-CANDIDATE_PAIRS = [
-    ("KO", "PEP"),
-    ("XOM", "CVX"),
-    ("HD", "LOW"),
-    ("V", "MA"),
-    ("GLD", "GDX"),
-]
+logger.info("Loaded %d candidate pairs", len(CANDIDATE_PAIRS))
 
 
 async def scheduled_cycle():
@@ -43,10 +40,17 @@ async def lifespan(app: FastAPI):
     await init_db()
     scheduler.add_job(scheduled_cycle, "interval", minutes=5, id="agent_cycle")
     scheduler.start()
-    logger.info("Agent scheduler started")
+    logger.info("Agent scheduler started — running first cycle now")
+    asyncio.create_task(scheduled_cycle())
     yield
     scheduler.shutdown()
 
 
 app = FastAPI(title="AgenticTradingSystem", lifespan=lifespan)
 app.include_router(router)
+
+
+@app.get("/", include_in_schema=False)
+async def root():
+    from fastapi.responses import RedirectResponse
+    return RedirectResponse(url="/api/")

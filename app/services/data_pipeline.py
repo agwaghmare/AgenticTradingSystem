@@ -1,9 +1,10 @@
 import asyncio
 import logging
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
+import httpx
 import pandas as pd
 import yfinance as yf
 from sqlalchemy import select, delete
@@ -16,8 +17,10 @@ from app.models.orm import PriceHistory, TickerMetadata
 logger = logging.getLogger("data_pipeline")
 
 _sector_cache: dict[str, str | None] = {}
+_industry_cache: dict[str, str | None] = {}
 _FETCH_RETRIES = 3
 _FETCH_RETRY_DELAY_SEC = 2.0
+_TICKER_FETCH_DELAY_SEC = 1.25
 
 
 def _unique_tickers(candidate_pairs: list[tuple[str, str]]) -> list[str]:
@@ -43,7 +46,64 @@ def _normalize_ohlcv(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
+def _fetch_ohlcv_via_chart(ticker: str, days: int) -> pd.DataFrame:
+    end = datetime.now(timezone.utc)
+    start = end - timedelta(days=days + 5)
+    url = f"https://query1.finance.yahoo.com/v8/finance/chart/{ticker}"
+    response = httpx.get(
+        url,
+        params={
+            "period1": int(start.timestamp()),
+            "period2": int(end.timestamp()),
+            "interval": "1d",
+            "events": "history",
+        },
+        headers={"User-Agent": "Mozilla/5.0"},
+        timeout=30,
+    )
+    response.raise_for_status()
+    payload = response.json()["chart"]["result"][0]
+    quote = payload["indicators"]["quote"][0]
+    rows = []
+    for ts, o, h, l, c, v in zip(
+        payload["timestamp"],
+        quote.get("open", []),
+        quote.get("high", []),
+        quote.get("low", []),
+        quote.get("close", []),
+        quote.get("volume", []),
+    ):
+        if c is None:
+            continue
+        idx = pd.Timestamp(ts, unit="s", tz="UTC")
+        rows.append(
+            {
+                "open": float(o or c),
+                "high": float(h or c),
+                "low": float(l or c),
+                "close": float(c),
+                "volume": float(v or 0),
+                "_ts": idx,
+            }
+        )
+    if not rows:
+        return pd.DataFrame()
+    df = pd.DataFrame(rows).set_index("_ts")
+    df.index.name = None
+    return df
+
+
 def _fetch_ohlcv(ticker: str, period: str = "6mo", interval: str = "1d") -> pd.DataFrame:
+    days = settings.price_history_days
+    for attempt in range(_FETCH_RETRIES):
+        try:
+            df = _fetch_ohlcv_via_chart(ticker, days)
+            if not df.empty:
+                return df
+        except Exception as exc:
+            logger.warning("Chart API attempt %s/%s failed for %s: %s", attempt + 1, _FETCH_RETRIES, ticker, exc)
+            time.sleep(_FETCH_RETRY_DELAY_SEC * (attempt + 1))
+
     last_error: Exception | None = None
     for attempt in range(_FETCH_RETRIES):
         try:
@@ -54,7 +114,7 @@ def _fetch_ohlcv(ticker: str, period: str = "6mo", interval: str = "1d") -> pd.D
             return _normalize_ohlcv(df)
         except Exception as exc:
             last_error = exc
-            logger.warning("Fetch attempt %s/%s failed for %s: %s", attempt + 1, _FETCH_RETRIES, ticker, exc)
+            logger.warning("yfinance attempt %s/%s failed for %s: %s", attempt + 1, _FETCH_RETRIES, ticker, exc)
             time.sleep(_FETCH_RETRY_DELAY_SEC * (attempt + 1))
     if last_error:
         logger.error("All fetch attempts failed for %s", ticker)
@@ -79,29 +139,33 @@ def _fetch_intraday_last_timestamp(ticker: str) -> datetime | None:
         return None
 
 
-def _fetch_sector(ticker: str) -> str | None:
+def _fetch_metadata(ticker: str) -> tuple[str | None, str | None]:
     if ticker in _sector_cache:
-        return _sector_cache[ticker]
+        return _sector_cache[ticker], _industry_cache.get(ticker)
+
+    time.sleep(_TICKER_FETCH_DELAY_SEC)
     try:
-        info = yf.Ticker(ticker).info
+        info = yf.Ticker(ticker).info or {}
         sector = info.get("sector")
+        industry = info.get("industry")
         _sector_cache[ticker] = sector
-        return sector
+        _industry_cache[ticker] = industry
+        return sector, industry
     except Exception:
-        logger.exception("Failed to fetch sector for %s", ticker)
+        logger.exception("Failed to fetch metadata for %s", ticker)
         _sector_cache[ticker] = None
-        return None
+        _industry_cache[ticker] = None
+        return None, None
+
+
+def _fetch_sector(ticker: str) -> str | None:
+    sector, _ = _fetch_metadata(ticker)
+    return sector
 
 
 async def sync_ticker_metadata(db: AsyncSession, tickers: list[str]) -> None:
     for ticker in tickers:
-        sector = await asyncio.to_thread(_fetch_sector, ticker)
-        industry = None
-        try:
-            info = await asyncio.to_thread(lambda t=ticker: yf.Ticker(t).info)
-            industry = info.get("industry") if info else None
-        except Exception:
-            logger.debug("Could not fetch industry for %s", ticker)
+        sector, industry = await asyncio.to_thread(_fetch_metadata, ticker)
         stmt = insert(TickerMetadata).values(
             ticker=ticker,
             sector=sector,
@@ -118,6 +182,7 @@ async def sync_ticker_metadata(db: AsyncSession, tickers: list[str]) -> None:
 
 async def sync_price_history(db: AsyncSession, tickers: list[str]) -> None:
     for ticker in tickers:
+        await asyncio.sleep(_TICKER_FETCH_DELAY_SEC)
         df = await asyncio.to_thread(_fetch_ohlcv, ticker, f"{settings.price_history_days}d", "1d")
         if df.empty:
             logger.warning("No price history returned for %s", ticker)
@@ -173,7 +238,6 @@ async def get_latest_prices(
 ) -> dict[str, dict[str, Any]]:
     """Return {ticker: {close, high, low, open, last_timestamp}} for the agent."""
     tickers = _unique_tickers(candidate_pairs)
-    await sync_ticker_metadata(db, tickers)
     await sync_price_history(db, tickers)
 
     price_data: dict[str, dict[str, Any]] = {}
@@ -186,7 +250,8 @@ async def get_latest_prices(
 
         last_ts = await asyncio.to_thread(_fetch_intraday_last_timestamp, ticker)
         if last_ts is None:
-            last_ts = df.index[-1].to_pydatetime()
+            last_daily = df.index[-1]
+            last_ts = last_daily.to_pydatetime() if hasattr(last_daily, "to_pydatetime") else last_daily
 
         price_data[ticker] = {
             "close": df["close"],

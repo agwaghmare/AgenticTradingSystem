@@ -3,7 +3,8 @@ import asyncio
 import logging
 
 from app.db.session import AsyncSessionLocal, init_db
-from app.main import agent, CANDIDATE_PAIRS
+from app.pairs_universe import CANDIDATE_PAIRS
+from app.main import agent
 from app.services import data_pipeline
 
 logging.basicConfig(level=logging.INFO)

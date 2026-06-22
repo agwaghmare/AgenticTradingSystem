@@ -31,7 +31,9 @@ import pandas as pd
 import yfinance as yf
 
 from app.services import stats_engine, risk_engine
-from app.pairs_universe import SECTOR_UNIVERSE, generate_candidate_pairs, CANDIDATE_PAIRS
+from app.pairs_universe import FULL_CANDIDATE_PAIRS, generate_candidate_pairs
+
+CANDIDATE_PAIRS = FULL_CANDIDATE_PAIRS
 
 # ---------------------------------------------------------------------
 # CONFIG — edit thresholds in app/config.py; universe in app/pairs_universe.py

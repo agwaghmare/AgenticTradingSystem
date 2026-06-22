@@ -75,7 +75,7 @@ async def dashboard(db: AsyncSession = Depends(get_db)):
 <table><tr><th>Time</th><th>Pair</th><th>Action</th><th>Regime</th><th>Z</th><th>Reason</th></tr>
 {rows if rows else '<tr><td colspan="6">Waiting for first cycle…</td></tr>'}
 </table></div>
-<p style="color:#64748b;font-size:0.85rem">Auto-refreshes every 30s. Monitoring {len(CANDIDATE_PAIRS)} intra-sector pairs across {len(set(t for p in CANDIDATE_PAIRS for t in p))} tickers.</p>
+<p style="color:#64748b;font-size:0.85rem">Auto-refreshes every 30s. Monitoring {len(CANDIDATE_PAIRS)} high-conviction pairs ({len(set(t for p in CANDIDATE_PAIRS for t in p))} tickers) — filtered from 375-pair backtest.</p>
 </body></html>"""
 
 

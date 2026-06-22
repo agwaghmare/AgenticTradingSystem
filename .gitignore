@@ -9,3 +9,7 @@ alembic/__pycache__/
 scripts/backtest_trade_log.csv
 scripts/backtest_full_run.txt
 scripts/backtest_output.txt
+scripts/pair_rankings.csv
+scripts/high_conviction_pairs.py
+scripts/param_sweep_results.csv
+scripts/param_sweep_best.txt

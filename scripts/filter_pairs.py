@@ -28,7 +28,7 @@ PAIR_RANKINGS_CSV = Path(__file__).parent / "pair_rankings.csv"
 HIGH_CONVICTION_PY = Path(__file__).parent / "high_conviction_pairs.py"
 
 COMMISSION_PER_SHARE = 0.005
-MIN_TRADES = 5
+MIN_TRADES = 8
 MIN_SHARPE = 0.3
 MIN_NET_PNL = 0.0
 
@@ -46,11 +46,18 @@ def load_trade_log() -> pd.DataFrame:
 
 
 def calc_pair_metrics(df: pd.DataFrame) -> pd.DataFrame:
+    has_shares = "shares_a" in df.columns and "shares_b" in df.columns
+    if not has_shares:
+        print(
+            "WARNING: trade log missing shares_a/shares_b — using $5/trade commission estimate. "
+            "Re-run scripts/backtest.py to regenerate the log with per-share commission."
+        )
+
     rows = []
     for pair, group in df.groupby("pair"):
         group = group.copy()
 
-        if "shares_a" in group.columns and "shares_b" in group.columns:
+        if has_shares:
             commission = (group["shares_a"].fillna(0) + group["shares_b"].fillna(0)) * COMMISSION_PER_SHARE * 2
         else:
             commission = 5.0
@@ -121,7 +128,25 @@ def write_outputs(ranked: pd.DataFrame, high_conviction: pd.DataFrame):
 
     HIGH_CONVICTION_PY.write_text("\n".join(lines))
     print(f"High-conviction pairs saved to: {HIGH_CONVICTION_PY}")
-    print("Copy CANDIDATE_PAIRS from that file into app/pairs_universe.py or main.py")
+    sync_to_pairs_universe(pairs)
+
+
+def sync_to_pairs_universe(pairs: list[tuple[str, str]]) -> None:
+    """Write filtered pairs into app/pairs_universe.py for the live agent."""
+    path = Path(__file__).parent.parent / "app" / "pairs_universe.py"
+    text = path.read_text()
+    start_marker = "HIGH_CONVICTION_PAIRS: list[tuple[str, str]] = ["
+    end_marker = "\n]\n\n# Live agent uses filtered pairs"
+    start = text.index(start_marker)
+    end = text.index(end_marker, start) + len("\n]")
+    pair_lines = "\n".join(f'    ("{a}", "{b}"),' for a, b in pairs)
+    comment = (
+        f"# Filtered by scripts/filter_pairs.py (Sharpe>={MIN_SHARPE}, "
+        f"trades>={MIN_TRADES}, net P&L>${MIN_NET_PNL})"
+    )
+    block = f"{comment}\n{start_marker}\n{pair_lines}\n]"
+    path.write_text(text[:start] + block + text[end:])
+    print(f"Updated live universe in: {path} ({len(pairs)} pairs)")
 
 
 def main():
@@ -132,10 +157,11 @@ def main():
     high_conviction = filter_high_conviction(ranked)
 
     print("\n" + "=" * 70)
-    print("TOP 20 PAIRS BY SHARPE (after commission)")
+    print(f"TOP 20 PAIRS BY SHARPE (after commission, min {MIN_TRADES} trades)")
     print("=" * 70)
+    qualified = ranked[ranked["trades"] >= MIN_TRADES]
     print(
-        ranked.head(20)[
+        qualified.head(20)[
             ["pair", "trades", "net_pnl", "win_rate_pct", "sharpe", "avg_trade_pnl", "dollar_stops", "targets", "coint_broke"]
         ].to_string(index=False)
     )

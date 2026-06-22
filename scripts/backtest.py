@@ -137,6 +137,18 @@ class PairPosition:
         self.consecutive_breaks = 0
 
 
+def _trade_log_row(pair_a: str, pair_b: str, today, reason: str, pnl: float, position: PairPosition, exit_z) -> dict:
+    return {
+        "pair": f"{pair_a}/{pair_b}",
+        "exit_date": today,
+        "reason": reason,
+        "pnl": pnl,
+        "exit_z": exit_z,
+        "shares_a": position.shares_a,
+        "shares_b": position.shares_b,
+    }
+
+
 def run_backtest():
     all_series = load_price_data(sorted({t for pair in CANDIDATE_PAIRS for t in pair}))
     print(f"Running walk-forward backtest on {len(CANDIDATE_PAIRS)} intra-sector pairs...")
@@ -215,26 +227,23 @@ def run_backtest():
                     pnl = _close_position(position, price_a_today, price_b_today)
                     pnl_total += pnl
                     reason = "dollar_stop" if hit_dollar_stop else "zscore_stop"
-                    trade_log.append({
-                        "pair": f"{pair_a}/{pair_b}", "exit_date": today,
-                        "reason": reason, "pnl": pnl, "exit_z": z,
-                    })
+                    trade_log.append(
+                        _trade_log_row(pair_a, pair_b, today, reason, pnl, position, z)
+                    )
                     position = PairPosition()
                 elif hit_target:
                     pnl = _close_position(position, price_a_today, price_b_today)
                     pnl_total += pnl
-                    trade_log.append({
-                        "pair": f"{pair_a}/{pair_b}", "exit_date": today,
-                        "reason": "target", "pnl": pnl, "exit_z": z,
-                    })
+                    trade_log.append(
+                        _trade_log_row(pair_a, pair_b, today, "target", pnl, position, z)
+                    )
                     position = PairPosition()
                 elif hit_coint_break:
                     pnl = _close_position(position, price_a_today, price_b_today)
                     pnl_total += pnl
-                    trade_log.append({
-                        "pair": f"{pair_a}/{pair_b}", "exit_date": today,
-                        "reason": "cointegration_broke", "pnl": pnl, "exit_z": z,
-                    })
+                    trade_log.append(
+                        _trade_log_row(pair_a, pair_b, today, "cointegration_broke", pnl, position, z)
+                    )
                     position = PairPosition()
 
                 equity_curve.append({"date": today, "cum_pnl": pnl_total})

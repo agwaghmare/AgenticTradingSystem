@@ -13,3 +13,4 @@ scripts/pair_rankings.csv
 scripts/high_conviction_pairs.py
 scripts/param_sweep_results.csv
 scripts/param_sweep_best.txt
+scripts/param_sweep_run.txt

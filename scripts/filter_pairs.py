@@ -29,7 +29,7 @@ HIGH_CONVICTION_PY = Path(__file__).parent / "high_conviction_pairs.py"
 
 COMMISSION_PER_SHARE = 0.005
 MIN_TRADES = 8
-MIN_SHARPE = 0.3
+MIN_SHARPE = 1.2
 MIN_NET_PNL = 0.0
 
 INITIAL_CAPITAL = 100_000
@@ -90,8 +90,9 @@ def calc_pair_metrics(df: pd.DataFrame) -> pd.DataFrame:
                 "avg_trade_pnl": round(avg_pnl, 2),
                 "best_trade": round(best_trade, 2),
                 "worst_trade": round(worst_trade, 2),
-                "dollar_stops": reasons.get("dollar_stop", 0),
+                "stops": reasons.get("pnl_stop", 0) + reasons.get("dollar_stop", 0) + reasons.get("zscore_stop", 0),
                 "targets": reasons.get("target", 0),
+                "time_stops": reasons.get("time_stop", 0),
                 "coint_broke": reasons.get("cointegration_broke", 0),
             }
         )
@@ -162,7 +163,7 @@ def main():
     qualified = ranked[ranked["trades"] >= MIN_TRADES]
     print(
         qualified.head(20)[
-            ["pair", "trades", "net_pnl", "win_rate_pct", "sharpe", "avg_trade_pnl", "dollar_stops", "targets", "coint_broke"]
+            ["pair", "trades", "net_pnl", "win_rate_pct", "sharpe", "avg_trade_pnl", "stops", "targets", "time_stops", "coint_broke"]
         ].to_string(index=False)
     )
 

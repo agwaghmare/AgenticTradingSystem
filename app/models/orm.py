@@ -112,3 +112,24 @@ class TickerMetadata(Base):
     sector: Mapped[str | None] = mapped_column(String)
     industry: Mapped[str | None] = mapped_column(String)
     updated_at: Mapped[datetime] = mapped_column(TIMESTAMP(timezone=True), default=datetime.utcnow)
+
+
+class LiveTrade(Base):
+    """Closed paper/live trades for out-of-sample Sharpe tracking."""
+
+    __tablename__ = "live_trade"
+
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    closed_at: Mapped[datetime] = mapped_column(TIMESTAMP(timezone=True), nullable=False, index=True)
+    strategy_type: Mapped[str] = mapped_column(String, nullable=False)  # PAIR | SINGLE
+    symbol_a: Mapped[str] = mapped_column(String, nullable=False)
+    symbol_b: Mapped[str | None] = mapped_column(String)
+    direction: Mapped[str] = mapped_column(String, nullable=False)
+    entry_price: Mapped[float] = mapped_column(Numeric(16, 4), nullable=False)
+    exit_price: Mapped[float] = mapped_column(Numeric(16, 4), nullable=False)
+    shares: Mapped[float] = mapped_column(Numeric(16, 4), nullable=False)
+    realized_pnl: Mapped[float] = mapped_column(Numeric(16, 2), nullable=False)
+    exit_reason: Mapped[str] = mapped_column(String, nullable=False)
+    z_entry: Mapped[float | None] = mapped_column(Numeric(10, 4))
+    z_exit: Mapped[float | None] = mapped_column(Numeric(10, 4))
+    model_version: Mapped[str] = mapped_column(String, nullable=False)

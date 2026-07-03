@@ -8,7 +8,8 @@ from app.models.orm import DecisionLog, RiskSnapshot, OrderLog
 from app.services.llm_explainer import narrate_cycle, review_decisions
 from app.services.broker import BrokerClient
 
-from app.pairs_universe import CANDIDATE_PAIRS
+from app.pairs_universe import CANDIDATE_PAIRS, SINGLE_STOCK_UNIVERSE
+from app.services import live_performance
 
 router = APIRouter(prefix="/api", tags=["monitoring"])
 
@@ -50,6 +51,17 @@ async def dashboard(db: AsyncSession = Depends(get_db)):
             f"MTD DD {float(risk.drawdown_mtd_pct or 0):.1%} · Regime {risk.regime} · {risk.halt_status}"
         )
 
+    perf = await live_performance.get_live_performance(db)
+    sharpe_line = "—"
+    if perf.get("sharpe_ann") is not None:
+        reliable = "reliable" if perf.get("sharpe_reliable") else f"need {perf['min_trades_for_sharpe']}+ trades"
+        sharpe_line = f"{perf['sharpe_ann']} ({reliable})"
+    perf_block = (
+        f"Closed trades: {perf['trade_count']} · Live P&L: ${perf['total_pnl']:,.2f} · "
+        f"Win rate: {perf['win_rate_pct']}% · OOS Sharpe: {sharpe_line} · "
+        f"Target: >{perf['oos_target_sharpe']}"
+    )
+
     return f"""<!DOCTYPE html>
 <html><head>
 <meta charset="utf-8"><meta http-equiv="refresh" content="30">
@@ -68,14 +80,15 @@ async def dashboard(db: AsyncSession = Depends(get_db)):
   <strong>Decisions logged:</strong> {decision_count} &nbsp;|&nbsp;
   <strong>Cycle interval:</strong> 5 min &nbsp;|&nbsp;
   <a href="/docs">API Docs</a> · <a href="/api/decisions/recent">JSON decisions</a> ·
-  <a href="/api/risk/latest">JSON risk</a>
+  <a href="/api/risk/latest">JSON risk</a> · <a href="/api/performance/live">JSON live Sharpe</a>
 </div>
 <div class="card"><strong>Latest risk snapshot</strong><br>{risk_block}</div>
+<div class="card"><strong>Out-of-sample live performance</strong> (paper trades only — not backtest)<br>{perf_block}</div>
 <div class="card"><strong>Recent decisions</strong>
 <table><tr><th>Time</th><th>Pair</th><th>Action</th><th>Regime</th><th>Z</th><th>Reason</th></tr>
 {rows if rows else '<tr><td colspan="6">Waiting for first cycle…</td></tr>'}
 </table></div>
-<p style="color:#64748b;font-size:0.85rem">Auto-refreshes every 30s. Monitoring {len(CANDIDATE_PAIRS)} high-conviction pairs ({len(set(t for p in CANDIDATE_PAIRS for t in p))} tickers) — filtered from 375-pair backtest.</p>
+<p style="color:#64748b;font-size:0.85rem">Auto-refreshes every 30s. {len(CANDIDATE_PAIRS)} frozen pairs + {len(SINGLE_STOCK_UNIVERSE)} single-stock names. Params locked — see app/strategy_params.py. In-sample backtest Sharpe is NOT a forecast.</p>
 </body></html>"""
 
 
@@ -135,6 +148,12 @@ async def review_recent(limit: int = 200, db: AsyncSession = Depends(get_db)):
 
     review = review_decisions(decisions, window_label=f"last {limit} decisions")
     return {"review": review}
+
+
+@router.get("/performance/live")
+async def live_performance_stats(db: AsyncSession = Depends(get_db)):
+    """Out-of-sample Sharpe from closed paper trades (not backtest)."""
+    return await live_performance.get_live_performance(db)
 
 
 @router.get("/health")

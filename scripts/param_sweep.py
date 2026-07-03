@@ -1,14 +1,12 @@
 """
-Parameter sweep for the pairs trading backtest.
+Parameter sweep for the pairs trading backtest (portfolio mode).
 
-Tests combinations of zscore_entry, stop_loss_pct, and lookback_window with
-commission friction ($0.005/share round-trip per leg), ranked by Sharpe.
-
-Imports and monkey-patches scripts/backtest.run_backtest() — core fixes apply
-automatically. Runs sequentially to avoid Yahoo 429s; checkpoints each combo.
+Tests zscore_entry, stop_loss_pct, and lookback_window with commission,
+max concurrent positions, and hedge-drift filters. Ranked by trade-level Sharpe.
 
 Run from project root:
     python scripts/param_sweep.py
+    python scripts/param_sweep.py --universe filtered
 """
 
 import sys
@@ -20,6 +18,7 @@ import warnings
 
 warnings.filterwarnings("ignore")
 
+import argparse
 import json
 import itertools
 import time
@@ -29,28 +28,15 @@ import numpy as np
 import pandas as pd
 
 PARAM_GRID = {
-    "zscore_entry": [1.5, 2.0, 2.5],
-    "stop_loss_pct": [0.02, 0.03, 0.05],
-    "lookback_window": [60, 100, 120],
+    "zscore_entry": [2.0, 2.5, 3.0],
+    "stop_loss_pct": [0.02, 0.03, 0.04],
+    "lookback_window": [60, 80, 100],
 }
 
 COMMISSION_PER_SHARE = 0.005
 
 RESULTS_CSV = Path(__file__).parent / "param_sweep_results.csv"
 BEST_TXT = Path(__file__).parent / "param_sweep_best.txt"
-
-
-def _close_position_with_commission(position, price_a: float, price_b: float) -> float:
-    shares_a = position.shares_a
-    shares_b = position.shares_b
-
-    if position.direction == "LONG_SPREAD":
-        gross = shares_a * (price_a - position.entry_price_a) - shares_b * (price_b - position.entry_price_b)
-    else:
-        gross = -shares_a * (price_a - position.entry_price_a) + shares_b * (price_b - position.entry_price_b)
-
-    commission = (shares_a + shares_b) * COMMISSION_PER_SHARE * 2
-    return float(gross - commission)
 
 
 def _calc_sharpe(trade_log: list[dict], initial_capital: float = 100_000) -> float:
@@ -65,7 +51,7 @@ def _calc_sharpe(trade_log: list[dict], initial_capital: float = 100_000) -> flo
     return float((mean_r / std_r) * np.sqrt(252))
 
 
-def run_single_combo(combo: dict) -> dict:
+def run_single_combo(combo: dict, candidate_pairs: list[tuple[str, str]]) -> dict:
     import importlib
     import scripts.backtest as bt
 
@@ -74,18 +60,17 @@ def run_single_combo(combo: dict) -> dict:
     bt.ZSCORE_ENTRY = combo["zscore_entry"]
     bt.STOP_LOSS_PCT = combo["stop_loss_pct"]
     bt.LOOKBACK_WINDOW = combo["lookback_window"]
-    bt._close_position = _close_position_with_commission
 
     t0 = time.time()
     try:
-        results, trade_log = bt.run_backtest()
+        results, trade_log = bt.run_backtest(candidate_pairs, portfolio_mode=True)
     except Exception as e:
         return {**combo, "error": str(e), "sharpe": -999, "total_pnl": None, "trades": 0, "win_rate": None}
 
     elapsed = time.time() - t0
 
     total_pnl = sum(r["total_pnl"] for r in results)
-    trades = sum(r["trades_entered"] for r in results)
+    trades = len(trade_log)
     wins = sum(1 for t in trade_log if t["pnl"] > 0)
     win_rate = wins / len(trade_log) * 100 if trade_log else 0.0
     sharpe = _calc_sharpe(trade_log)
@@ -100,19 +85,34 @@ def run_single_combo(combo: dict) -> dict:
         "total_pnl": round(total_pnl, 2),
         "trades": trades,
         "win_rate": round(win_rate, 1),
-        "dollar_stops": reasons.get("dollar_stop", 0),
+        "dollar_stops": reasons.get("pnl_stop", 0) + reasons.get("dollar_stop", 0),
         "coint_broke": reasons.get("cointegration_broke", 0),
         "targets": reasons.get("target", 0),
         "elapsed_min": round(elapsed / 60, 1),
     }
 
 
+def parse_args():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--universe", choices=["full", "filtered"], default="full")
+    parser.add_argument("--reset", action="store_true", help="Clear prior sweep results")
+    return parser.parse_args()
+
+
 def main():
+    args = parse_args()
+    from app.pairs_universe import FULL_CANDIDATE_PAIRS, HIGH_CONVICTION_PAIRS
+
+    candidate_pairs = HIGH_CONVICTION_PAIRS if args.universe == "filtered" else FULL_CANDIDATE_PAIRS
+
+    if args.reset and RESULTS_CSV.exists():
+        RESULTS_CSV.unlink()
+
     keys = list(PARAM_GRID.keys())
     values = list(PARAM_GRID.values())
     combos = [dict(zip(keys, v)) for v in itertools.product(*values)]
 
-    print(f"Parameter sweep: {len(combos)} combinations")
+    print(f"Parameter sweep (portfolio mode): {len(combos)} combinations on {len(candidate_pairs)} pairs")
     print(f"Parameters: {json.dumps(PARAM_GRID, indent=2)}")
     print(f"Commission: ${COMMISSION_PER_SHARE}/share/side (round-trip both legs)")
     print(f"Results will be saved to: {RESULTS_CSV}")
@@ -138,7 +138,7 @@ def main():
 
         for i, combo in enumerate(remaining):
             print(f"[{i+1}/{len(remaining)}] Testing: {combo}")
-            result = run_single_combo(combo)
+            result = run_single_combo(combo, candidate_pairs)
             print(
                 f"  Sharpe: {result['sharpe']:.3f} | P&L: ${result.get('total_pnl', 'ERR'):,} | "
                 f"Trades: {result['trades']} | WR: {result.get('win_rate', '?')}%"
@@ -175,7 +175,7 @@ def main():
 
     top3 = all_results.head(3)
     summary_lines = [
-        "TOP 3 CONFIGURATIONS BY SHARPE (after $0.005/share commission)\n",
+        "TOP 3 CONFIGURATIONS BY SHARPE (portfolio mode, after commission)\n",
         "=" * 60,
     ]
     for rank, (_, row) in enumerate(top3.iterrows(), 1):

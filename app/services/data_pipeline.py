@@ -23,11 +23,15 @@ _FETCH_RETRY_DELAY_SEC = 2.0
 _TICKER_FETCH_DELAY_SEC = 1.25
 
 
-def _unique_tickers(candidate_pairs: list[tuple[str, str]]) -> list[str]:
+def _unique_tickers(
+    candidate_pairs: list[tuple[str, str]], extra_tickers: list[str] | None = None
+) -> list[str]:
     tickers: set[str] = set()
     for a, b in candidate_pairs:
         tickers.add(a)
         tickers.add(b)
+    if extra_tickers:
+        tickers.update(extra_tickers)
     tickers.add(settings.market_benchmark_ticker)
     return sorted(tickers)
 
@@ -234,10 +238,12 @@ async def _load_price_series_from_db(db: AsyncSession, ticker: str) -> pd.DataFr
 
 
 async def get_latest_prices(
-    db: AsyncSession, candidate_pairs: list[tuple[str, str]]
+    db: AsyncSession,
+    candidate_pairs: list[tuple[str, str]],
+    extra_tickers: list[str] | None = None,
 ) -> dict[str, dict[str, Any]]:
     """Return {ticker: {close, high, low, open, last_timestamp}} for the agent."""
-    tickers = _unique_tickers(candidate_pairs)
+    tickers = _unique_tickers(candidate_pairs, extra_tickers)
     await sync_price_history(db, tickers)
 
     price_data: dict[str, dict[str, Any]] = {}

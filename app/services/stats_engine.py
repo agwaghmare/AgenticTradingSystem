@@ -5,7 +5,7 @@ from statsmodels.regression.linear_model import OLS
 from statsmodels.tools import add_constant
 from pykalman import KalmanFilter
 
-from app.models.schemas import CointegrationResult, HedgeRatioResult
+from app.models.schemas import CointegrationResult, HedgeRatioResult, PriceMeanReversionResult
 from app.config import settings
 
 
@@ -27,7 +27,7 @@ def check_cointegration(series_a: pd.Series, series_b: pd.Series, pair_a: str, p
         p_value=float(p_value),
         half_life_days=float(half_life),
         is_cointegrated=p_value < settings.cointegration_pvalue_max
-        and 0 < half_life < settings.half_life_max_days,
+        and settings.half_life_min_days <= half_life < settings.half_life_max_days,
     )
 
 
@@ -74,10 +74,15 @@ def compute_hedge_ratio_kalman(
 
 
 def calc_zscore(spread: pd.Series, lookback: int = 20) -> float:
+    """Latest z-score of spread vs rolling mean. Returns NaN when the spread is
+    flat/degenerate (zero std) instead of blowing up to +/-inf."""
     rolling_mean = spread.rolling(lookback).mean()
     rolling_std = spread.rolling(lookback).std()
-    z = (spread - rolling_mean) / rolling_std
-    return float(z.iloc[-1])
+    mean = float(rolling_mean.iloc[-1])
+    std = float(rolling_std.iloc[-1])
+    if not np.isfinite(std) or std <= 1e-12 or not np.isfinite(mean):
+        return float("nan")
+    return float((float(spread.iloc[-1]) - mean) / std)
 
 
 def calc_atr(high: pd.Series, low: pd.Series, close: pd.Series, period: int = 14) -> float:
@@ -96,3 +101,29 @@ def calc_atr(high: pd.Series, low: pd.Series, close: pd.Series, period: int = 14
     if pd.isna(value) or value <= 0:
         return float(close.iloc[-1] * 0.02)
     return value
+
+
+def check_price_mean_reversion(
+    close: pd.Series,
+    ticker: str,
+    lookback: int = 20,
+) -> PriceMeanReversionResult:
+    """Log-price z-score vs rolling mean; OU half-life on demeaned log price."""
+    log_price = np.log(close.astype(float))
+    residual = log_price - log_price.rolling(lookback).mean()
+    z = calc_zscore(residual, lookback=lookback)
+    half_life = _ornstein_uhlenbeck_half_life(residual.dropna())
+
+    is_mr = (
+        np.isfinite(z)
+        and settings.half_life_min_days <= half_life < settings.half_life_max_days
+    )
+
+    # Keep NaN as NaN — substituting 0.0 would look like a "reverted" spread and
+    # trip target exits downstream. Consumers must check finiteness.
+    return PriceMeanReversionResult(
+        ticker=ticker,
+        z_score=float(z),
+        half_life_days=float(half_life),
+        is_mean_reverting=is_mr,
+    )
